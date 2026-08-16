@@ -4,365 +4,145 @@
 #include "../tester/utils.h"
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
-#include <vector>
-#include <cuda_fp16.h>
 
 
 template <typename T>
 __global__ void rmsNormKernel(const T* __restrict__ input,
                               const T* __restrict__ weight,
                               T* __restrict__ output,
+                              size_t rows,
                               size_t hidden_dim,
                               float eps) {
-    size_t row = blockIdx.x;
-    size_t tid = threadIdx.x;
-    size_t stride = (hidden_dim + blockDim.x - 1) / blockDim.x; // 每个线程处理的元素数
+    size_t row=blockIdx.x;
+    size_t tid=threadIdx.x;
+    size_t stride=blockDim.x;
 
-    // 1. 每个线程累加自己负责的多个元素的平方和
-    float sum_sq = 0.0f;
-    for (size_t s = 0; s < stride; ++s) {
-        size_t col = tid * stride + s;
-        if (col < hidden_dim) {
-            float val = static_cast<float>(input[row * hidden_dim + col]);
-            sum_sq += val * val;
-        }
+    float sum=0.0f;
+    for(size_t i=tid;i<hidden_dim;i+=stride){
+         float val=input[row*hidden_dim+i];
+        sum+=val*val;
     }
 
-    // 2. 共享内存归约（每个线程贡献一个 partial sum）
-    __shared__ float s_partial[256];
-    s_partial[tid] = sum_sq;
+    extern __shared__ float smem[];
+    smem[tid]=sum; 
     __syncthreads();
 
-    // 树形归约（要求 blockDim.x 是2的幂，这里满足）
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_partial[tid] += s_partial[tid + s];
+    for(size_t s=stride/2;s>0;s>>=1){
+        if(tid<s){
+            smem[tid]+=smem[tid+s];
         }
         __syncthreads();
     }
 
-    // 3. 计算逆均方根并广播
-    float inv_rms = 1.0f;
-    if (tid == 0) {
-        float mean = s_partial[0] / static_cast<float>(hidden_dim);
-        inv_rms = rsqrtf(mean + eps);
-    }
-    __shared__ float s_inv_rms;
-    if (tid == 0) s_inv_rms = inv_rms;
-    __syncthreads();
-    inv_rms = s_inv_rms;
+    float total_sum=smem[0];
+    float rms=rsqrtf(total_sum / static_cast<float>(hidden_dim) + eps);
 
-    // 4. 归一化、加权并写回（每个线程处理相同范围的元素）
-    for (size_t s = 0; s < stride; ++s) {
-        size_t col = tid * stride + s;
-        if (col < hidden_dim) {
-            float val = static_cast<float>(input[row * hidden_dim + col]);
-            float w   = static_cast<float>(weight[col]);
-            output[row * hidden_dim + col] = static_cast<T>(val * inv_rms * w);
+    for(size_t i=tid;i<hidden_dim;i+=stride){
+        output[row*hidden_dim+i]=static_cast<T>(
+        (static_cast<float>(input[row*hidden_dim+i]))
+        *rms
+        *static_cast<float>(weight[i])
+        );
+    }
+
+}
+
+
+template <typename T>
+__global__ void flash_attention_kernel(const T* q, const T* k, const T* v, T* out,
+                                       int batch_size, int target_seq_len, int src_seq_len,
+                                       int query_heads, int kv_heads, int head_dim,
+                                       bool is_causal, float scale) {
+    // 每个线程处理一个 query 位置 (b, i, h)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_queries = batch_size * target_seq_len * query_heads;
+    if (idx >= total_queries) return;
+
+    int h = idx % query_heads;
+    int tmp = idx / query_heads;
+    int i = tmp % target_seq_len;
+    int b = tmp / target_seq_len;
+
+    int group_size = query_heads / kv_heads;
+    int hk = h / group_size;
+
+    // 查询向量缓存
+    constexpr int kMaxHeadDim = 256;
+    float q_cache[kMaxHeadDim];
+    size_t q_offset = (size_t)idx * head_dim;
+    for (int d = 0; d < head_dim; ++d) {
+        q_cache[d] = static_cast<float>(q[q_offset + d]);
+    }
+
+    // 全局在线 softmax 状态
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc[kMaxHeadDim];  // 每个维度一个累加器
+    for (int d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+
+    // 分段参数
+    constexpr int kSegmentSize = 32;  // 每段包含的 key 数量
+
+    int last_key = src_seq_len - 1;
+    if (is_causal && i < last_key) last_key = i;
+
+    int j = 0;
+    while (j <= last_key) {
+        int seg_end = min(j + kSegmentSize - 1, last_key);
+        // 段内局部最大值
+        float local_m = -1e30f;
+        // 存储段内每个 key 的 score（或即时计算）
+        // 我们需先计算段内所有 key 的 score 得到 local_m
+        for (int jj = j; jj <= seg_end; ++jj) {
+            size_t k_offset = ((size_t)b * src_seq_len + jj) * kv_heads * head_dim + hk * head_dim;
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                float k_val = static_cast<float>(k[k_offset + d]);
+                score += q_cache[d] * k_val;  // 或使用 FMA
+            }
+            score *= scale;
+            local_m = fmaxf(local_m, score);
         }
-    }
-}
 
+        // 计算段内 exp 和 weighted sum
+        float local_l = 0.0f;
+        float local_acc[kMaxHeadDim];
+        for (int d = 0; d < head_dim; ++d) local_acc[d] = 0.0f;
 
-template <typename T>
-__device__ __forceinline__ float attentionToFloat(T value)
-{
-    return static_cast<float>(value);
-}
-
-template <>
-__device__ __forceinline__ float attentionToFloat<half>(half value)
-{
-    return __half2float(value);
-}
-
-template <typename T>
-__device__ __forceinline__ T attentionFromFloat(float value)
-{
-    return static_cast<T>(value);
-}
-
-template <>
-__device__ __forceinline__ half attentionFromFloat<half>(float value)
-{
-    return __float2half_rn(value);
-}
-
-
-/*
- * 测试中的 head_dim 不超过 256。
- *
- * 每个 CUDA 线程负责一个完整的：
- *   (batch, query position, query head)
- *
- * 使用线程私有数组避免 block 归约改变 Q·K 的浮点加法顺序。
- */
-constexpr int kAttentionMaxHeadDim = 256;
-
-
-/*
- * 严格按照 dimension=0,1,... 的顺序执行 FP32 FMA。
- *
- * 不要改成：
- *
- *     dot += q * k;
- *
- * 也不要改成 block/warp reduction，否则 float 结果会因为
- * 浮点加法顺序发生变化。
- */
-template <typename T>
-__device__ __forceinline__ float attentionSerialDot(
-    const float* __restrict__ query_cache,
-    const T* __restrict__ key_row,
-    int head_dim)
-{
-    float dot_product = 0.0f;
-
-#pragma unroll 1
-    for (int dimension = 0;
-         dimension < head_dim;
-         ++dimension) {
-        const float key_value =
-            attentionToFloat(key_row[dimension]);
-
-        dot_product = fmaf(
-            query_cache[dimension],
-            key_value,
-            dot_product);
-    }
-
-    return dot_product;
-}
-
-
-template <typename T>
-__global__ void flashAttnKernel(
-    const T* __restrict__ query,
-    const T* __restrict__ key,
-    const T* __restrict__ value,
-    T* __restrict__ output,
-    int batch_size,
-    int target_seq_len,
-    int src_seq_len,
-    int query_heads,
-    int kv_heads,
-    int head_dim,
-    bool is_causal)
-{
-    const int linear_index =
-        static_cast<int>(blockIdx.x) *
-            static_cast<int>(blockDim.x) +
-        static_cast<int>(threadIdx.x);
-
-    const int total_queries =
-        batch_size * target_seq_len * query_heads;
-
-    if (linear_index >= total_queries) {
-        return;
-    }
-
-    /*
-     * linear_index 的布局对应：
-     *
-     * [batch, target_seq_len, query_heads]
-     */
-    const int query_head =
-        linear_index % query_heads;
-
-    const int query_index =
-        (linear_index / query_heads) % target_seq_len;
-
-    const int batch_index =
-        linear_index /
-        (target_seq_len * query_heads);
-
-    /*
-     * GQA/MQA 映射。
-     *
-     * query_heads=8、kv_heads=2：
-     *
-     * Q heads 0,1,2,3 -> KV head 0
-     * Q heads 4,5,6,7 -> KV head 1
-     */
-    const int query_heads_per_kv_head =
-        query_heads / kv_heads;
-
-    const int kv_head =
-        query_head / query_heads_per_kv_head;
-
-    const size_t query_offset =
-        static_cast<size_t>(linear_index) *
-        static_cast<size_t>(head_dim);
-
-    float query_cache[kAttentionMaxHeadDim];
-    float output_accumulator[kAttentionMaxHeadDim];
-
-#pragma unroll 1
-    for (int dimension = 0;
-         dimension < head_dim;
-         ++dimension) {
-        query_cache[dimension] =
-            attentionToFloat(
-                query[query_offset + dimension]);
-
-        output_accumulator[dimension] = 0.0f;
-    }
-
-    /*
-     * 必须以 float 在 GPU 上计算。
-     *
-     * 不要在 host 端使用 double sqrt 后再传入，
-     * 这会改变严格 float 测试中的舍入路径。
-     */
-    const float scale =
-        1.0f /
-        sqrtf(static_cast<float>(head_dim));
-
-    /*
-     * torch SDPA 的 causal mask 为左上对齐：
-     *
-     * Q0 -> K0
-     * Q1 -> K0, K1
-     * Q2 -> K0, K1, K2
-     */
-    int last_key_index = src_seq_len - 1;
-
-    if (is_causal &&
-        query_index < last_key_index) {
-        last_key_index = query_index;
-    }
-
-    /*
-     * 第一遍：求最大 attention score。
-     */
-    float maximum_score = -1.0f / 0.0f;
-
-#pragma unroll 1
-    for (int key_index = 0;
-         key_index <= last_key_index;
-         ++key_index) {
-        const size_t key_offset =
-            ((static_cast<size_t>(batch_index) *
-                  static_cast<size_t>(src_seq_len) +
-              static_cast<size_t>(key_index)) *
-                 static_cast<size_t>(kv_heads) +
-             static_cast<size_t>(kv_head)) *
-            static_cast<size_t>(head_dim);
-
-        const float dot_product =
-            attentionSerialDot(
-                query_cache,
-                key + key_offset,
-                head_dim);
-
-        const float score =
-            dot_product * scale;
-
-        maximum_score =
-            fmaxf(maximum_score, score);
-    }
-
-    /*
-     * 第二遍：计算稳定 Softmax 分母。
-     */
-    float denominator = 0.0f;
-
-#pragma unroll 1
-    for (int key_index = 0;
-         key_index <= last_key_index;
-         ++key_index) {
-        const size_t key_offset =
-            ((static_cast<size_t>(batch_index) *
-                  static_cast<size_t>(src_seq_len) +
-              static_cast<size_t>(key_index)) *
-                 static_cast<size_t>(kv_heads) +
-             static_cast<size_t>(kv_head)) *
-            static_cast<size_t>(head_dim);
-
-        const float dot_product =
-            attentionSerialDot(
-                query_cache,
-                key + key_offset,
-                head_dim);
-
-        const float score =
-            dot_product * scale;
-
-        const float unnormalized_probability =
-            expf(score - maximum_score);
-
-        denominator += unnormalized_probability;
-    }
-
-    /*
-     * 只进行一次除法。第三遍使用乘法：
-     *
-     * probability = exp(score - max) * inverse_denominator
-     */
-    const float inverse_denominator =
-        denominator > 0.0f
-            ? 1.0f / denominator
-            : 0.0f;
-
-    /*
-     * 第三遍：重新计算概率并完成 P·V。
-     */
-#pragma unroll 1
-    for (int key_index = 0;
-         key_index <= last_key_index;
-         ++key_index) {
-        const size_t kv_offset =
-            ((static_cast<size_t>(batch_index) *
-                  static_cast<size_t>(src_seq_len) +
-              static_cast<size_t>(key_index)) *
-                 static_cast<size_t>(kv_heads) +
-             static_cast<size_t>(kv_head)) *
-            static_cast<size_t>(head_dim);
-
-        const float dot_product =
-            attentionSerialDot(
-                query_cache,
-                key + kv_offset,
-                head_dim);
-
-        const float score =
-            dot_product * scale;
-
-        const float unnormalized_probability =
-            expf(score - maximum_score);
-
-        const float probability =
-            inverse_denominator *
-            unnormalized_probability;
-
-#pragma unroll 1
-        for (int dimension = 0;
-             dimension < head_dim;
-             ++dimension) {
-            const float value_element =
-                attentionToFloat(
-                    value[kv_offset + dimension]);
-
-            /*
-             * 保持 probability * V + accumulator
-             * 为一次舍入的 FP32 FMA。
-             */
-            output_accumulator[dimension] =
-                fmaf(
-                    probability,
-                    value_element,
-                    output_accumulator[dimension]);
+        for (int jj = j; jj <= seg_end; ++jj) {
+            size_t kv_offset = ((size_t)b * src_seq_len + jj) * kv_heads * head_dim + hk * head_dim;
+            // 重新计算 score（因为未缓存）
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                score += q_cache[d] * static_cast<float>(k[kv_offset + d]);
+            }
+            score *= scale;
+            float exp_val = expf(score - local_m);
+            local_l += exp_val;
+            // 累加 V（每个维度）
+            for (int d = 0; d < head_dim; ++d) {
+                float v_val = static_cast<float>(v[kv_offset + d]);
+                local_acc[d] += exp_val * v_val;
+            }
         }
+
+        // 在线合并到全局
+        float m_new = fmaxf(m, local_m);
+        float alpha = expf(m - m_new);
+        float beta = expf(local_m - m_new);
+        l = l * alpha + local_l * beta;
+        for (int d = 0; d < head_dim; ++d) {
+            acc[d] = acc[d] * alpha + local_acc[d] * beta;
+        }
+        m = m_new;
+
+        j = seg_end + 1;
     }
 
-#pragma unroll 1
-    for (int dimension = 0;
-         dimension < head_dim;
-         ++dimension) {
-        output[query_offset + dimension] =
-            attentionFromFloat<T>(
-                output_accumulator[dimension]);
+    // 写回
+    float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+        out[q_offset + d] = static_cast<T>(acc[d] * inv_l);
     }
 }
 
@@ -409,12 +189,13 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
   cudaMemPrefetchAsync(input,h_input.size()*sizeof(T),device,stream);
   cudaMemPrefetchAsync(weight,h_weight.size()*sizeof(T),device,stream);
 
-
-  size_t shared_mem = 256 * sizeof(T);
-  rmsNormKernel<T><<<rows, 256, shared_mem,stream>>>(
-        input, weight, output, hidden_dim, eps
+  dim3 block(32);
+  dim3 grid(rows);
+  
+  size_t shared_mem_size=256*sizeof(float);
+  rmsNormKernel<T><<<grid, block, shared_mem_size,stream>>>(
+        input, weight, output,rows,hidden_dim, eps
     );
-
   cudaMemcpy(h_output.data(), output, h_output.size()*sizeof(T), cudaMemcpyDeviceToHost);
   
   cudaFree(input);
@@ -444,135 +225,54 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {       
     // TODO: Implement the flash attention function
-    constexpr int kMaxHeadDim = 256;
-    constexpr int threads_per_block = 256;
+    //     // 打印传入的维度参数（调试用）
+    // printf("DEBUG Attention: batch=%d, target_seq=%d, src_seq=%d, q_heads=%d, kv_heads=%d, head_dim=%d, causal=%d\n",
+    //        batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, (int)is_causal);
+     // 计算元素总数
+    int q_size = batch_size * target_seq_len * query_heads * head_dim;
+    int k_size = batch_size * src_seq_len * kv_heads * head_dim;
+    int v_size = k_size;
+    int o_size = q_size;
 
-    if (batch_size <= 0 ||
-        target_seq_len <= 0 ||
-        query_heads <= 0 ||
-        kv_heads <= 0 ||
-        head_dim <= 0) {
-        return;
+    // 确保输出向量有足够的空间（可选，根据调用约定可调整）
+    if (h_o.size() != o_size) {
+        h_o.resize(o_size);
     }
 
-    if (query_heads % kv_heads != 0) {
-        return;
-    }
+    // 分配设备内存
+    T *d_q, *d_k, *d_v, *d_o;
+    cudaMalloc(&d_q, q_size * sizeof(T));
+    cudaMalloc(&d_k, k_size * sizeof(T));
+    cudaMalloc(&d_v, v_size * sizeof(T));
+    cudaMalloc(&d_o, o_size * sizeof(T));
 
-    /*
-     * 当前 kernel 的线程私有缓存支持 head_dim <= 256。
-     */
-    if (head_dim > kAttentionMaxHeadDim) {
-        return;
-    }
+    // 拷贝输入数据到设备
+    cudaMemcpy(d_q, h_q.data(), q_size * sizeof(T), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, h_k.data(), k_size * sizeof(T), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, h_v.data(), v_size * sizeof(T), cudaMemcpyHostToDevice);
 
-    const size_t query_element_count =
-        static_cast<size_t>(batch_size) *
-        static_cast<size_t>(target_seq_len) *
-        static_cast<size_t>(query_heads) *
-        static_cast<size_t>(head_dim);
+    // 缩放因子 1/sqrt(head_dim)
+    float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-    const size_t kv_element_count =
-        static_cast<size_t>(batch_size) *
-        static_cast<size_t>(src_seq_len) *
-        static_cast<size_t>(kv_heads) *
-        static_cast<size_t>(head_dim);
+    // 启动配置
+    int total_queries = batch_size * target_seq_len * query_heads;
+    int block_size = 256;
+    int grid_size = (total_queries + block_size - 1) / block_size;  
 
-    if (h_q.size() < query_element_count ||
-        h_k.size() < kv_element_count ||
-        h_v.size() < kv_element_count ||
-        h_o.size() < query_element_count) {
-        return;
-    }
+    // 启动内核
+    flash_attention_kernel<T><<<grid_size, block_size>>>(
+        d_q, d_k, d_v, d_o,
+        batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim, is_causal, scale);
 
-    /*
-     * 空 K/V 的安全处理。
-     */
-    if (src_seq_len <= 0) {
-        for (size_t index = 0;
-             index < query_element_count;
-             ++index) {
-            h_o[index] = T{};
-        }
+    // 拷贝输出回主机
+    cudaMemcpy(h_o.data(), d_o, o_size * sizeof(T), cudaMemcpyDeviceToHost);
 
-        return;
-    }
-
-    T* d_query = nullptr;
-    T* d_key = nullptr;
-    T* d_value = nullptr;
-    T* d_output = nullptr;
-
-    cudaMalloc(
-        reinterpret_cast<void**>(&d_query),
-        query_element_count * sizeof(T));
-
-    cudaMalloc(
-        reinterpret_cast<void**>(&d_key),
-        kv_element_count * sizeof(T));
-
-    cudaMalloc(
-        reinterpret_cast<void**>(&d_value),
-        kv_element_count * sizeof(T));
-
-    cudaMalloc(
-        reinterpret_cast<void**>(&d_output),
-        query_element_count * sizeof(T));
-
-    cudaMemcpy(
-        d_query,
-        h_q.data(),
-        query_element_count * sizeof(T),
-        cudaMemcpyHostToDevice);
-
-    cudaMemcpy(
-        d_key,
-        h_k.data(),
-        kv_element_count * sizeof(T),
-        cudaMemcpyHostToDevice);
-
-    cudaMemcpy(
-        d_value,
-        h_v.data(),
-        kv_element_count * sizeof(T),
-        cudaMemcpyHostToDevice);
-
-
-    const size_t total_queries =
-        static_cast<size_t>(batch_size) *
-        static_cast<size_t>(target_seq_len) *
-        static_cast<size_t>(query_heads);
-
-    const unsigned int block_count =
-        static_cast<unsigned int>(
-            (total_queries + threads_per_block - 1) /
-            threads_per_block);
-
-    flashAttnKernel<T>
-        <<<block_count, threads_per_block>>>(
-            d_query,
-            d_key,
-            d_value,
-            d_output,
-            batch_size,
-            target_seq_len,
-            src_seq_len,
-            query_heads,
-            kv_heads,
-            head_dim,
-            is_causal);
-
-    cudaMemcpy(
-        h_o.data(),
-        d_output,
-        query_element_count * sizeof(T),
-        cudaMemcpyDeviceToHost);
-
-    cudaFree(d_query);
-    cudaFree(d_key);
-    cudaFree(d_value);
-    cudaFree(d_output);
-   
+    // 释放设备内存
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_o);
 }
 
 // *********************************************************************
